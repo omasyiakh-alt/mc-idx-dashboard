@@ -16,6 +16,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import data_provider as dp
+import factors as fc
+import market_data as md
 import mc_engine as mc
 import signals as sg
 
@@ -151,11 +153,16 @@ if _app_pw and not st.session_state.get("auth_ok"):
         st.error("Kata sandi salah.")
     st.stop()
 
-page = st.sidebar.radio("Halaman", ["Analisis emiten", "Screener LQ45"], horizontal=True)
+page = st.sidebar.radio("Halaman", ["Analisis emiten", "Screener LQ45", "Backtest"])
 if page == "Screener LQ45":
     import screener
 
     screener.render(fmt_pct, {"tp": C_TP, "sl": C_SL, "gray": C_GRAY})
+    st.stop()
+if page == "Backtest":
+    import backtest
+
+    backtest.render(fmt_pct, {"tp": C_TP, "sl": C_SL, "gray": C_GRAY, "blue": C_BLUE})
     st.stop()
 
 with st.sidebar:
@@ -201,7 +208,12 @@ with st.sidebar:
     t_df = st.slider("Derajat bebas Student-t", 3.0, 30.0, 4.0, 0.5) if innovation == "student_t" else 4.0
     drift_mode = st.radio("Drift dasar", ["historis", "nol"], horizontal=True,
                           help="'nol' = tanpa asumsi tren masa lalu; hanya sinyal FF/Bandar yang menggeser drift.")
-    use_ewma = st.checkbox("Volatilitas campuran EWMA (lebih responsif)", value=True)
+    vol_model = st.selectbox(
+        "Model volatilitas", ["garch", "ewma"],
+        format_func={"garch": "GARCH(1,1) (disarankan)", "ewma": "Historis + EWMA"}.get,
+        help="GARCH memperkirakan volatilitas tiap hari ke depan: tinggi setelah gejolak lalu kembali ke rata-rata "
+             "jangka panjang.")
+    use_ewma = vol_model == "ewma"
     auto_reject = st.checkbox("Terapkan batas ARA/ARB IDX", value=True)
     arb = st.slider("Batas ARB", 0.05, 0.35, 0.15, 0.01, disabled=not auto_reject)
     seed = st.number_input("Seed acak (0 = acak tiap run)", value=42, step=1)
@@ -232,9 +244,17 @@ with st.sidebar:
 
     sig_window = st.slider("Jendela sinyal (hari bursa)", 5, 60, 20)
 
+    st.header("Faktor tambahan (Yahoo)")
+    use_mom = st.checkbox("Momentum & kekuatan relatif vs IHSG", value=True)
+    use_mkt = st.checkbox("Proxy asing pasar (EIDO + USD/IDR)", value=True)
+    use_comm = st.checkbox("Komoditas terkait (bila ada)", value=True)
+
     st.header("Pengaruh sinyal")
     w_ff = st.slider("Bobot Foreign Flow", 0.0, 1.0, 0.5, 0.05)
     w_bd = st.slider("Bobot Bandarmology", 0.0, 1.0, 0.5, 0.05)
+    w_mom = st.slider("Bobot Momentum & RS", 0.0, 1.0, 0.5, 0.05, disabled=not use_mom)
+    w_mkt = st.slider("Bobot Proxy asing pasar", 0.0, 1.0, 0.3, 0.05, disabled=not use_mkt)
+    w_comm = st.slider("Bobot Komoditas", 0.0, 1.0, 0.4, 0.05, disabled=not use_comm)
     strength = st.slider("Kekuatan geser drift (× σ harian)", 0.0, 0.5, 0.10, 0.01,
                          help="Skor gabungan +1 menambah drift harian sebesar nilai ini × volatilitas harian.")
     vol_boost = st.slider("Tambahan volatilitas saat distribusi", 0.0, 1.0, 0.25, 0.05)
@@ -365,6 +385,28 @@ elif bd_source == "Input manual":
     bd_tag = "Input manual"
 
 # ----------------------------------------------------------------------------
+# Faktor tambahan (Yahoo Finance)
+# ----------------------------------------------------------------------------
+ihsg_s = md.load_close(fc.IHSG) if use_mom else None
+eido_s = md.load_close(fc.EIDO) if use_mkt else None
+fx_s = md.load_close(fc.USDIDR) if use_mkt else None
+comm_keys = fc.commodity_keys(ticker) if use_comm else []
+comm_s = {k: md.load_close(fc.COMMODITIES[k][0]) for k in comm_keys}
+
+mom_res = fc.momentum_score(px, ihsg_s) if use_mom else {"score": 0.0, "detail": {}}
+mkt_res = fc.market_foreign_proxy(px, eido_s, fx_s) if use_mkt else {"score": 0.0, "detail": {}}
+comm_res = fc.commodity_score(px, comm_s) if comm_keys else {"score": 0.0, "detail": {}, "active": False}
+extra = []
+if use_mom:
+    extra.append((mom_res["score"], w_mom))
+if use_mkt:
+    extra.append((mkt_res["score"], w_mkt))
+if comm_res.get("active"):
+    extra.append((comm_res["score"], w_comm))
+garch_res = fc.garch_fit(px["Close"]) if len(px) > 120 else None
+regime = fc.vol_regime(garch_res) if garch_res else None
+
+# ----------------------------------------------------------------------------
 # Jalankan simulasi
 # ----------------------------------------------------------------------------
 cfg = dict(
@@ -372,7 +414,8 @@ cfg = dict(
     use_ewma_vol=use_ewma, ff_score=ff_res["score"], bd_score=bd_res["score"],
     w_ff=w_ff, w_bd=w_bd, strength=strength, vol_boost=vol_boost, half_life=float(half_life),
     apply_auto_reject=auto_reject, arb=arb, drift_mode=drift_mode,
-    seed=None if int(seed) == 0 else int(seed),
+    seed=None if int(seed) == 0 else int(seed), vol_model=vol_model,
+    extra=tuple((round(float(s), 6), float(w)) for s, w in extra),
 )
 with st.spinner(f"Menjalankan {int(n_sims):,} simulasi × 126 hari bursa..."):
     close = px["Close"]
@@ -387,7 +430,8 @@ st.caption(f"Data harga: {price_src} · {len(px)} hari bursa · terakhir {px.ind
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Harga terakhir", fmt_rp(last_price))
 c2.metric("Volatilitas tahunan", fmt_pct(res.sigma_used * np.sqrt(mc.TRADING_DAYS)),
-          help=f"σ harian dipakai {res.sigma_used:.2%} (historis+EWMA {res.sigma_hist:.2%})")
+          help=f"σ harian hari pertama {res.sigma_used:.2%} ({'GARCH' if vol_model == 'garch' else 'historis+EWMA'}). "
+               f"Historis+EWMA: {res.sigma_hist:.2%}.")
 c3.metric("Skor Foreign Flow", f"{ff_res['score']:+.2f}", score_label(ff_res["score"]), delta_color="off", delta_arrow="off",
           help=ff_tag)
 c4.metric("Skor Bandarmology", f"{bd_res['score']:+.2f}", score_label(bd_res["score"]), delta_color="off", delta_arrow="off",
@@ -395,6 +439,21 @@ c4.metric("Skor Bandarmology", f"{bd_res['score']:+.2f}", score_label(bd_res["sc
 c5.metric("Skor gabungan", f"{res.combined:+.2f}",
           f"drift {res.tilt * res.sigma_used * 245:+.1%}/thn awal", delta_color="off", delta_arrow="off",
           help="Tambahan drift tahunan di awal periode sebelum memudar sesuai waktu paruh.")
+
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("Momentum & RS", f"{mom_res['score']:+.2f}" if use_mom else "off",
+          score_label(mom_res["score"]).replace("Akumulasi", "Positif").replace("Distribusi", "Negatif")
+          if use_mom else None, delta_color="off", delta_arrow="off")
+d2.metric("Proxy asing pasar", f"{mkt_res['score']:+.2f}" if use_mkt else "off",
+          score_label(mkt_res["score"]).replace("Akumulasi", "Positif").replace("Distribusi", "Negatif")
+          if use_mkt else None, delta_color="off", delta_arrow="off",
+          help="EIDO + USD/IDR, dikalikan korelasi saham dengan EIDO. Bukan foreign flow per saham.")
+d3.metric("Komoditas", f"{comm_res['score']:+.2f}" if comm_res.get("active") else "-",
+          ", ".join(fc.COMMODITIES[k][1] for k in comm_keys) if comm_keys else "tidak terkait",
+          delta_color="off", delta_arrow="off")
+d4.metric("Rezim volatilitas", regime["label"] if regime else "-",
+          f"persentil {regime['percentile']:.0%} · jk. panjang {regime['vol_long'] * np.sqrt(mc.TRADING_DAYS):.0%}/thn"
+          if regime else None, delta_color="off", delta_arrow="off")
 
 tag_note = []
 if "PROXY" in bd_tag:
@@ -408,7 +467,8 @@ if tag_note:
 # ----------------------------------------------------------------------------
 # Tab per horizon
 # ----------------------------------------------------------------------------
-tabs = st.tabs([f"{h} · {d} hari" for h, d in mc.HORIZONS.items()] + ["Ringkasan", "Bandarmology & Asing"])
+tabs = st.tabs([f"{h} · {d} hari" for h, d in mc.HORIZONS.items()] + ["Ringkasan", "Bandarmology & Asing",
+                                                                        "Faktor tambahan"])
 all_stats = {}
 all_tpsl = {}
 
@@ -703,12 +763,117 @@ with tabs[len(mc.HORIZONS) + 1]:
         f"""
 **Cara sinyal masuk ke simulasi**
 
-- Skor gabungan = rata-rata berbobot FF dan Bandar = **{res.combined:+.2f}**.
+- Skor gabungan = rata-rata berbobot FF, Bandar, dan faktor tambahan yang aktif = **{res.combined:+.2f}**.
 - Drift harian ditambah `skor × {strength:.2f} × σ harian`, lalu memudar setengahnya tiap **{half_life}** hari bursa.
 - Bila skor gabungan negatif (distribusi), volatilitas dinaikkan hingga **{vol_boost:.0%}** × |skor|.
 - Setiap langkah dipotong batas ARA/ARB dan harga dibulatkan ke fraksi harga IDX saat menentukan TP/SL.
 """
     )
+
+
+# ----------------------------------------------------------------------------
+# Tab faktor tambahan
+# ----------------------------------------------------------------------------
+with tabs[len(mc.HORIZONS) + 2]:
+    st.subheader("1 · Volatilitas GARCH(1,1)")
+    if garch_res:
+        ann = np.sqrt(mc.TRADING_DAYS)
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("Vol besok (tahunan)", fmt_pct(regime["vol_now"] * ann))
+        g2.metric("Vol jangka panjang", fmt_pct(regime["vol_long"] * ann))
+        g3.metric("Persistensi α+β", f"{garch_res['persistence']:.3f}",
+                  help="Mendekati 1 = gejolak bertahan lama sebelum kembali normal.")
+        g4.metric("Rezim", regime["label"], f"persentil {regime['percentile']:.0%} dari 2 tahun",
+                  delta_color="off", delta_arrow="off")
+        cv = garch_res["cond_vol"].tail(500) * ann
+        fut_idx = pd.bdate_range(px.index[-1] + pd.Timedelta(days=1), periods=126)
+        fut = fc.garch_sigma_path(garch_res, 126) * ann
+        gv = go.Figure()
+        gv.add_trace(go.Scatter(x=cv.index, y=cv.values, name="Historis (kondisional)",
+                                line=dict(color=C_BLUE, width=2), hovertemplate="%{x|%d %b %Y}: %{y:.1%}<extra></extra>"))
+        gv.add_trace(go.Scatter(x=fut_idx, y=fut, name="Perkiraan 126 hari", line=dict(color=C_ORANGE, width=2, dash="dash"),
+                                hovertemplate="%{x|%d %b %Y}: %{y:.1%}<extra></extra>"))
+        gv.update_layout(title="Volatilitas tahunan: historis & perkiraan GARCH", height=340, yaxis_tickformat=".0%",
+                         legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(gv, width="stretch")
+        if not garch_res["converged"]:
+            st.warning("Estimasi GARCH tidak konvergen; dipakai parameter cadangan.")
+    else:
+        st.info("Data kurang dari 120 hari bursa untuk GARCH.")
+
+    st.markdown("---")
+    st.subheader("2 · Momentum & kekuatan relatif")
+    if use_mom:
+        cl = px["Close"].tail(260)
+        mf = go.Figure()
+        mf.add_trace(go.Scatter(x=cl.index, y=cl, name="Close", line=dict(color=C_BLUE, width=2)))
+        for n, col, dash in ((20, C_GRAY, "dot"), (50, C_ORANGE, "dash"), (200, C_SL, "solid")):
+            ma = px["Close"].rolling(n).mean().tail(260)
+            mf.add_trace(go.Scatter(x=ma.index, y=ma, name=f"MA{n}", line=dict(color=col, width=1.5, dash=dash)))
+        mf.update_layout(title="Harga & moving average", height=340, hovermode="x unified",
+                         legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(mf, width="stretch")
+        if ihsg_s is not None:
+            both = pd.concat([px["Close"], ihsg_s], axis=1, keys=["s", "i"]).dropna().tail(260)
+            if len(both) > 20:
+                rf = go.Figure()
+                rf.add_trace(go.Scatter(x=both.index, y=both["s"] / both["s"].iloc[0] * 100, name=ticker,
+                                        line=dict(color=C_BLUE, width=2)))
+                rf.add_trace(go.Scatter(x=both.index, y=both["i"] / both["i"].iloc[0] * 100, name="IHSG",
+                                        line=dict(color=C_GRAY, width=2)))
+                rf.update_layout(title="Kinerja relatif (indeks = 100)", height=300, hovermode="x unified",
+                                 legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=50, b=10))
+                st.plotly_chart(rf, width="stretch")
+        else:
+            st.caption("Data IHSG (^JKSE) tidak tersedia; kekuatan relatif dilewati.")
+        st.dataframe(detail_df(mom_res["detail"]), width="stretch")
+    else:
+        st.caption("Nonaktif.")
+
+    st.markdown("---")
+    st.subheader("3 · Proxy asing tingkat pasar")
+    st.caption("EIDO = ETF iShares MSCI Indonesia di bursa AS; arus dana ke ETF ini mencerminkan minat asing pada "
+               "saham Indonesia secara umum. Rupiah menguat biasanya sejalan dengan dana asing masuk. Skor dikalikan "
+               "korelasi saham dengan EIDO, sehingga saham yang jarang disentuh asing mendapat pengaruh kecil.")
+    if use_mkt:
+        mc1, mc2 = st.columns(2)
+        for col, s, title in ((mc1, eido_s, "EIDO (USD)"), (mc2, fx_s, "USD/IDR")):
+            with col:
+                if s is not None:
+                    ss = s.tail(130)
+                    f = go.Figure(go.Scatter(x=ss.index, y=ss, line=dict(color=C_BLUE, width=2),
+                                             hovertemplate="%{x|%d %b}: %{y:,.2f}<extra></extra>"))
+                    f.update_layout(title=title, height=280, margin=dict(l=10, r=10, t=50, b=10))
+                    st.plotly_chart(f, width="stretch")
+                else:
+                    st.caption(f"{title}: data tidak tersedia")
+        st.dataframe(detail_df(mkt_res["detail"]), width="stretch")
+    else:
+        st.caption("Nonaktif.")
+
+    st.markdown("---")
+    st.subheader("4 · Komoditas terkait")
+    if comm_keys:
+        cf = go.Figure()
+        base = px["Close"].tail(260)
+        cf.add_trace(go.Scatter(x=base.index, y=base / base.iloc[0] * 100, name=ticker, line=dict(color=C_BLUE, width=2)))
+        palette = [C_ORANGE, C_TP, C_SL]
+        for i, k in enumerate(comm_keys):
+            s = comm_s.get(k)
+            if s is None:
+                continue
+            s = s[s.index >= base.index[0]]
+            if len(s):
+                cf.add_trace(go.Scatter(x=s.index, y=s / s.iloc[0] * 100, name=fc.COMMODITIES[k][1],
+                                        line=dict(color=palette[i % 3], width=2)))
+        cf.update_layout(title="Saham vs komoditas (indeks = 100)", height=320, hovermode="x unified",
+                         legend=dict(orientation="h", y=-0.2), margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(cf, width="stretch")
+        st.dataframe(detail_df(comm_res["detail"]), width="stretch")
+    else:
+        na = [k for k, v in fc.NOT_AVAILABLE.items() if ticker in v]
+        st.caption(f"{ticker} tidak dipetakan ke komoditas di Yahoo Finance."
+                   + (f" Harga {', '.join(na)} tidak tersedia gratis di Yahoo, jadi tidak dipakai." if na else ""))
 
 st.caption("Simulasi ini alat bantu manajemen risiko, bukan rekomendasi beli/jual. Hasil sangat bergantung "
            "pada asumsi distribusi return dan kualitas data sinyal.")

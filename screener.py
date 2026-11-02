@@ -15,8 +15,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import factors as fc
+import market_data as md
 import mc_engine as mc
-import signals as sg
 
 # Perkiraan konstituen LQ45. Daftar resmi berganti tiap Februari & Agustus:
 # cek idx.co.id dan sunting daftar ini di layar bila ada perubahan.
@@ -53,11 +54,16 @@ def download_many(tickers: tuple, period: str) -> dict:
     return out
 
 
+def load_aux() -> dict:
+    return {"ihsg": md.load_close(fc.IHSG), "eido": md.load_close(fc.EIDO), "fx": md.load_close(fc.USDIDR),
+            "comm": {k: md.load_close(sym) for k, (sym, _) in fc.COMMODITIES.items()}}
+
+
 def screen_one(t: str, px: pd.DataFrame, days: int, rr: tuple, cfg: dict, objective: str,
-               sig_window: int) -> dict:
-    bd = sg.bandar_score_proxy(px, sig_window)
-    c = mc.SimConfig(**{**cfg, "horizon_days": days, "ff_score": 0.0, "bd_score": bd["score"],
-                        "w_ff": 0.0, "w_bd": 1.0})
+               sig_window: int, weights: dict) -> dict:
+    sigs = fc.yahoo_signals(t, px, load_aux(), weights, sig_window)
+    c = mc.SimConfig(**{**cfg, "horizon_days": days, "ff_score": 0.0, "bd_score": 0.0,
+                        "w_ff": 0.0, "w_bd": 0.0, "extra": sigs["extra"]})
     res = mc.simulate(px["Close"], c)
     best = mc.suggest_tp_sl_rr(res, days, rr[0], rr[1], objective=objective)
     lr = np.log(px["Close"]).diff().dropna()
@@ -71,7 +77,9 @@ def screen_one(t: str, px: pd.DataFrame, days: int, rr: tuple, cfg: dict, object
         "Median hari ke TP": best["days_to_tp"],
         "P(naik)": float((ret_end > 0).mean()),
         "VaR95": float(-np.percentile(ret_end, 5)),
-        "Skor bandar (proxy)": bd["score"],
+        "Skor gabungan": res.combined,
+        "Skor bandar (proxy)": sigs["bd"], "Momentum & RS": sigs["mom"], "Proxy asing pasar": sigs["mkt"],
+        "Komoditas": sigs["comm"],
         "Return 3B": float(px["Close"].iloc[-1] / px["Close"].iloc[-min(63, len(px) - 1)] - 1),
         "Vol tahunan": float(lr.tail(126).std() * np.sqrt(mc.TRADING_DAYS)),
     }
@@ -79,20 +87,20 @@ def screen_one(t: str, px: pd.DataFrame, days: int, rr: tuple, cfg: dict, object
 
 @st.cache_data(ttl=3 * 3600, show_spinner=False)
 def screen_cached(t: str, tickers: tuple, period: str, days: int, rr: tuple, cfg_items: tuple, objective: str,
-                  sig_window: int, _day: date):
+                  sig_window: int, w_items: tuple, _day: date):
     data = download_many(tickers, period)
     if t not in data:
         return None
-    return screen_one(t, data[t], days, rr, dict(cfg_items), objective, sig_window)
+    return screen_one(t, data[t], days, rr, dict(cfg_items), objective, sig_window, dict(w_items))
 
 
 def run_screen(tickers: tuple, period: str, days: int, rr: tuple, cfg_items: tuple, objective: str,
-               sig_window: int) -> tuple[pd.DataFrame, list]:
+               sig_window: int, w_items: tuple) -> tuple[pd.DataFrame, list]:
     rows, failed = [], []
     bar = st.progress(0.0, text="Menjalankan simulasi...")
     for i, t in enumerate(tickers):
         try:
-            r = screen_cached(t, tickers, period, days, rr, cfg_items, objective, sig_window, date.today())
+            r = screen_cached(t, tickers, period, days, rr, cfg_items, objective, sig_window, w_items, date.today())
         except Exception:  # noqa: BLE001
             r = None
         if r is None:
@@ -110,8 +118,9 @@ def run_screen(tickers: tuple, period: str, days: int, rr: tuple, cfg_items: tup
 
 def render(fmt_pct, colors: dict):
     st.title("Screener LQ45 · peluang TP lebih dulu")
-    st.caption("Sumber data: Yahoo Finance (gratis). Sinyal bandarmology memakai PROXY dari harga & volume "
-               "(CMF, A/D, OBV). Foreign flow tidak tersedia dari sumber terbuka, sehingga dianggap netral.")
+    st.caption("Sumber data: Yahoo Finance (gratis). Sinyal: bandarmology PROXY dari harga & volume, momentum & "
+               "kekuatan relatif vs IHSG, proxy asing pasar (EIDO + USD/IDR), dan komoditas terkait. Volatilitas "
+               "GARCH(1,1). Foreign flow per saham tidak tersedia dari sumber terbuka.")
 
     with st.sidebar:
         st.header("Pengaturan screener")
@@ -128,6 +137,15 @@ def render(fmt_pct, colors: dict):
         drift_mode = st.radio("Drift dasar", ["historis", "nol"], horizontal=True)
         strength = st.slider("Kekuatan geser drift (× σ harian)", 0.0, 0.5, 0.10, 0.01)
         sig_window = st.slider("Jendela sinyal (hari bursa)", 5, 60, 20)
+        vol_model = st.selectbox("Model volatilitas", ["garch", "ewma"],
+                                 format_func={"garch": "GARCH(1,1)", "ewma": "Historis + EWMA"}.get)
+        st.caption("Bobot sinyal (0 = tidak dipakai)")
+        w_items = tuple(sorted({
+            "bd": st.slider("Bandarmology proxy", 0.0, 1.0, fc.DEFAULT_WEIGHTS["bd"], 0.05),
+            "mom": st.slider("Momentum & RS vs IHSG", 0.0, 1.0, fc.DEFAULT_WEIGHTS["mom"], 0.05),
+            "mkt": st.slider("Proxy asing pasar (EIDO+USD/IDR)", 0.0, 1.0, fc.DEFAULT_WEIGHTS["mkt"], 0.05),
+            "comm": st.slider("Komoditas", 0.0, 1.0, fc.DEFAULT_WEIGHTS["comm"], 0.05),
+        }.items()))
         min_p = st.slider("Tampilkan P(TP dulu) minimal", 0.0, 0.9, 0.0, 0.05)
 
     with st.expander(f"Daftar saham ({len(LQ45_DEFAULT)} emiten LQ45, bisa disunting)"):
@@ -140,7 +158,7 @@ def render(fmt_pct, colors: dict):
     cfg_items = tuple(sorted({
         "n_sims": int(n_sims), "innovation": "bootstrap", "use_ewma_vol": True, "strength": strength,
         "vol_boost": 0.25, "half_life": 21.0, "apply_auto_reject": True, "arb": 0.15,
-        "drift_mode": drift_mode, "seed": 42,
+        "drift_mode": drift_mode, "seed": 42, "vol_model": vol_model,
     }.items()))
 
     if not st.button(f"Jalankan screener ({len(tickers)} saham)", type="primary") and \
@@ -152,7 +170,7 @@ def render(fmt_pct, colors: dict):
 
     with st.spinner(f"Mengunduh harga {len(tickers)} saham dari Yahoo Finance..."):
         download_many(tickers, period)
-    df, failed = run_screen(tickers, period, days, tuple(rr), cfg_items, objective, sig_window)
+    df, failed = run_screen(tickers, period, days, tuple(rr), cfg_items, objective, sig_window, w_items)
     if failed:
         st.warning(f"Tidak ada data / gagal diproses: {', '.join(failed)}")
     if df.empty:
@@ -189,7 +207,9 @@ def render(fmt_pct, colors: dict):
     st.dataframe(
         view.style.format({**{c: "{:.1%}" for c in pct}, "Edge": "{:+.1%}", "Expectancy": "{:+.2%}",
                            "Return 3B": "{:+.1%}", "Harga": "{:,.0f}", "TP": "{:,.0f}", "SL": "{:,.0f}",
-                           "R:R": "1:{:.2f}", "Median hari ke TP": "{:.0f}", "Skor bandar (proxy)": "{:+.2f}"},
+                           "R:R": "1:{:.2f}", "Median hari ke TP": "{:.0f}", "Skor bandar (proxy)": "{:+.2f}",
+                           "Skor gabungan": "{:+.2f}", "Momentum & RS": "{:+.2f}", "Proxy asing pasar": "{:+.2f}",
+                           "Komoditas": "{:+.2f}"},
                           na_rep="-"),
         width="stretch", height=620,
     )

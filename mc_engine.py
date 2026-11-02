@@ -78,6 +78,8 @@ class SimConfig:
     arb: float = 0.15
     drift_mode: str = "historis"    # historis | nol
     seed: int | None = 42
+    vol_model: str = "garch"        # garch | ewma
+    extra: tuple = ()               # sinyal tambahan: ((skor, bobot), ...)
 
 
 @dataclass
@@ -90,6 +92,7 @@ class SimResult:
     combined: float
     tilt: float
     params: dict = field(default_factory=dict)
+    sigma_path: np.ndarray | None = None   # volatilitas harian per langkah
 
 
 # ----------------------------------------------------------------------------
@@ -114,18 +117,33 @@ def estimate_params(close: pd.Series, cfg: SimConfig) -> tuple[float, float, np.
 # ----------------------------------------------------------------------------
 # Simulasi
 # ----------------------------------------------------------------------------
-def simulate(close: pd.Series, cfg: SimConfig) -> SimResult:
+def combine_scores(cfg: SimConfig) -> float:
+    pairs = [(cfg.ff_score, cfg.w_ff), (cfg.bd_score, cfg.w_bd), *cfg.extra]
+    wsum = sum(w for _, w in pairs)
+    return sum(s * w for s, w in pairs) / wsum if wsum > 0 else 0.0
+
+
+def simulate(close: pd.Series, cfg: SimConfig, garch: dict | None = None) -> SimResult:
     rng = np.random.default_rng(cfg.seed)
     s0 = float(close.iloc[-1])
     mu_hist, sigma, resid = estimate_params(close, cfg)
     mu_base = mu_hist if cfg.drift_mode == "historis" else 0.0
-
-    wsum = cfg.w_ff + cfg.w_bd
-    combined = (cfg.w_ff * cfg.ff_score + cfg.w_bd * cfg.bd_score) / wsum if wsum > 0 else 0.0
-    tilt = cfg.strength * combined
-    sigma_used = sigma * (1.0 + cfg.vol_boost * max(0.0, -combined))
-
     n, T = cfg.n_sims, cfg.horizon_days
+
+    combined = combine_scores(cfg)
+    tilt = cfg.strength * combined
+    boost = 1.0 + cfg.vol_boost * max(0.0, -combined)
+
+    sig_path = np.full(T, sigma)
+    if cfg.vol_model == "garch" and len(close) > 120:
+        from factors import garch_fit, garch_sigma_path
+
+        g = garch if garch is not None else garch_fit(close)
+        sig_path = garch_sigma_path(g, T)
+        resid = g["std_resid"]
+    sig_path = sig_path * boost
+    sigma_used = float(sig_path[0])
+
     if cfg.innovation == "bootstrap" and len(resid) > 30:
         z = rng.choice(resid, size=(n, T), replace=True)
         z = (z - z.mean()) / z.std()
@@ -137,8 +155,8 @@ def simulate(close: pd.Series, cfg: SimConfig) -> SimResult:
 
     t = np.arange(1, T + 1)
     decay = 0.5 ** (t / cfg.half_life) if cfg.half_life > 0 else np.ones(T)
-    mu_t = mu_base + tilt * sigma_used * decay
-    lr = mu_t[None, :] + sigma_used * z
+    mu_t = mu_base + tilt * sig_path * decay
+    lr = mu_t[None, :] + sig_path[None, :] * z
 
     paths = np.empty((n, T + 1))
     paths[:, 0] = s0
@@ -153,7 +171,7 @@ def simulate(close: pd.Series, cfg: SimConfig) -> SimResult:
     return SimResult(
         paths=paths, s0=s0, mu_hist=mu_hist, sigma_hist=sigma, sigma_used=sigma_used,
         combined=combined, tilt=tilt,
-        params={"mu_base": mu_base, "decay_half_life": cfg.half_life},
+        params={"mu_base": mu_base, "decay_half_life": cfg.half_life}, sigma_path=sig_path,
     )
 
 

@@ -42,6 +42,22 @@ minimal 10.000 simulasi per saham, mencari TP/SL di rentang R:R timeframe yang d
 - Kartu "Peluang acak" menunjukkan 1/(1+R): saham di atas angka ini didorong drift positif dari tren dan sinyal proxy.
 - Hasil disimpan 3 jam dan bisa diunduh sebagai CSV.
 
+## Faktor tambahan (gratis, Yahoo Finance)
+Aktif di halaman analisis dan Screener; bisa dimatikan / diubah bobotnya di sidebar.
+1. **Volatilitas GARCH(1,1)**: volatilitas diperkirakan per hari ke depan (tinggi setelah gejolak, lalu kembali ke rata-rata jangka panjang). Juga menampilkan rezim volatilitas (Rendah/Normal/Tinggi).
+2. **Momentum & kekuatan relatif**: posisi harga vs MA20/50/200, momentum 6 bulan (tanpa 1 bulan terakhir), dan return 3 bulan vs IHSG (^JKSE).
+3. **Proxy asing tingkat pasar**: ETF EIDO (iShares MSCI Indonesia) dan kurs USD/IDR, dikalikan korelasi mingguan saham dengan EIDO. Bukan foreign flow per saham.
+4. **Komoditas**: batu bara (MTF=F), emas (GC=F), tembaga (HG=F), Brent (BZ=F) untuk saham yang dipetakan di `factors.py`. Nikel dan CPO tidak tersedia gratis di Yahoo.
+
+## Backtest walk-forward
+Halaman **Backtest** menguji apakah peluang dari simulasi bisa dipercaya. Di setiap tanggal uji di masa lalu, model hanya memakai
+data sampai tanggal itu, lalu dibandingkan dengan harga aktual:
+- cakupan pita 90% dan 50% (target ≈ 90% dan ≈ 50%),
+- pelanggaran VaR 95% (target ≈ 5%),
+- Brier score arah dan P(TP lebih dulu), serta skill dibanding model dasar (random walk tanpa sinyal),
+- grafik prediksi vs aktual, histogram posisi harga aktual (PIT), dan kurva kalibrasi P(TP lebih dulu).
+Beberapa nilai "kekuatan geser drift" bisa diuji sekaligus untuk mencari nilai yang paling terkalibrasi.
+
 ## Sumber data: mana yang riil, mana yang proxy
 | Data | Sumber | Status |
 |---|---|---|
