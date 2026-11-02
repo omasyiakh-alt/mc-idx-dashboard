@@ -151,6 +151,13 @@ if _app_pw and not st.session_state.get("auth_ok"):
         st.error("Kata sandi salah.")
     st.stop()
 
+page = st.sidebar.radio("Halaman", ["Analisis emiten", "Screener LQ45"], horizontal=True)
+if page == "Screener LQ45":
+    import screener
+
+    screener.render(fmt_pct, {"tp": C_TP, "sl": C_SL, "gray": C_GRAY})
+    st.stop()
+
 with st.sidebar:
     st.header("Emiten")
     ticker = st.text_input("Kode emiten", value="BBCA", help="Tanpa .JK, contoh: BBCA, TLKM, GOTO").upper().strip()

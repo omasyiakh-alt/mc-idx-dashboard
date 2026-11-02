@@ -33,6 +33,15 @@ Dengan `INDEXALPHA_API_KEY` terisi, foreign flow dan broker summary terambil oto
 - **Ringkasan**: tabel semua horizon + grafik VaR/CVaR, bisa diunduh CSV.
 - **Sinyal**: grafik net foreign, top broker net buy/sell, atau indikator proxy.
 
+## Screener LQ45 (hanya data open source)
+Pilih **Halaman > Screener LQ45** di sidebar. Dashboard mengunduh harga 45 saham LQ45 dari Yahoo Finance, menjalankan
+minimal 10.000 simulasi per saham, mencari TP/SL di rentang R:R timeframe yang dipilih, lalu mengurutkan saham dari
+**peluang TP tersentuh lebih dulu** tertinggi. Index Alpha tidak dipakai di halaman ini.
+- Sinyal bandarmology memakai proxy OHLCV (CMF, A/D, OBV). Foreign flow tidak tersedia dari sumber terbuka, jadi dianggap netral.
+- Daftar konstituen bisa disunting (LQ45 berganti tiap Februari & Agustus; cek idx.co.id).
+- Kartu "Peluang acak" menunjukkan 1/(1+R): saham di atas angka ini didorong drift positif dari tren dan sinyal proxy.
+- Hasil disimpan 3 jam dan bisa diunduh sebagai CSV.
+
 ## Sumber data: mana yang riil, mana yang proxy
 | Data | Sumber | Status |
 |---|---|---|
