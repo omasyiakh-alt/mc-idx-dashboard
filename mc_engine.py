@@ -256,3 +256,108 @@ def tp_sl_grid(res: SimResult, days: int, tp_pcts: np.ndarray, sl_pcts: np.ndarr
             pnl = np.where(tp_first, tpp, np.where(sl_first, -slp, end))
             out[a, b] = pnl.mean()
     return pd.DataFrame(out, index=[f"{s:.0%}" for s in sl_pcts], columns=[f"{t:.0%}" for t in tp_pcts])
+
+
+# ----------------------------------------------------------------------------
+# TP/SL berbasis target Risk:Reward per timeframe
+# ----------------------------------------------------------------------------
+# Kaidah umum: scalping (1D) 1:1–1:1,5; swing (1M–3M) 1:2–1:3. 1W dan 6M diinterpolasi.
+DEFAULT_RR = {
+    "1D": (1.0, 1.5),
+    "1W": (1.5, 2.0),
+    "1M": (2.0, 3.0),
+    "3M": (2.0, 3.0),
+    "6M": (2.5, 3.5),
+}
+
+
+def suggest_tp_sl_rr(res: SimResult, days: int, rr_lo: float, rr_hi: float, rr_step: float = 0.25,
+                     sl_probs: np.ndarray | None = None, objective: str = "edge",
+                     min_resolve: float = 0.5) -> dict:
+    """
+    Cari pasangan TP/SL yang R:R-nya berada di rentang [rr_lo, rr_hi] dan paling baik menurut simulasi.
+
+    1. Kandidat SL = harga terendah intra-periode yang disentuh oleh 5%..50% jalur
+       (SL dekat = sering tersentuh, SL jauh = jarang tersentuh).
+    2. Untuk tiap SL, TP = harga masuk + R × (harga masuk − SL), R dari rr_lo s/d rr_hi.
+    3. Setiap kombinasi diuji pada SEMUA jalur: mana yang tersentuh lebih dulu (TP atau SL),
+       sisanya keluar di harga akhir periode.
+    4. Pemilihan (objective):
+       - "edge"       : win rate (TP lebih dulu ÷ yang tersentuh) dikurangi win rate impas 1/(1+R).
+                        Hanya kombinasi yang selesai (TP/SL tersentuh) di ≥ min_resolve jalur.
+                        Bila tidak ada edge positif, dipilih peluang TP tertinggi (paling realistis).
+       - "expectancy" : return rata-rata strategi tertinggi.
+       - "p_tp"       : peluang TP lebih dulu tertinggi.
+    """
+    s0 = res.s0
+    seg = res.paths[:, 1 : days + 1]
+    run_max = np.maximum.accumulate(seg, axis=1)
+    run_min = np.minimum.accumulate(seg, axis=1)
+    end_ret = res.paths[:, days] / s0 - 1
+    big = days + 10
+    if sl_probs is None:
+        sl_probs = np.arange(0.05, 0.501, 0.05)
+    rr_vals = np.round(np.arange(rr_lo, rr_hi + 1e-9, rr_step), 4)
+    if len(rr_vals) == 0:
+        rr_vals = np.array([rr_lo])
+
+    path_min = run_min[:, -1]
+    tick = tick_size(s0)
+    rows, seen = [], set()
+    for ps in sl_probs:
+        sl = round_tick(min(float(np.percentile(path_min, 100 * ps)), s0 - tick), "up")
+        if sl >= s0 or sl < 1:
+            continue
+        hit_sl = run_min <= sl
+        i_sl = np.where(hit_sl[:, -1], hit_sl.argmax(axis=1), big)
+        risk = s0 - sl
+        tps = set()
+        for rr in rr_vals:
+            for mode in ("down", "up"):
+                tp = round_tick(s0 + rr * risk, mode)
+                if tp > s0 and rr_lo - 0.05 <= (tp - s0) / risk <= rr_hi + 0.05:
+                    tps.add(tp)
+        for tp in sorted(tps):
+            if (sl, tp) in seen:
+                continue
+            seen.add((sl, tp))
+            hit_tp = run_max >= tp
+            i_tp = np.where(hit_tp[:, -1], hit_tp.argmax(axis=1), big)
+            tp_first = i_tp < i_sl
+            sl_first = (i_sl <= i_tp) & (i_sl < big)  # hari sama -> SL dulu (konservatif)
+            pnl = np.where(tp_first, tp / s0 - 1, np.where(sl_first, sl / s0 - 1, end_ret))
+            p_tp, p_sl = float(tp_first.mean()), float(sl_first.mean())
+            decided = p_tp + p_sl
+            rr_real = (tp - s0) / risk
+            rows.append({
+                "tp": tp, "sl": sl, "rr": rr_real,
+                "p_tp": p_tp, "p_sl": p_sl, "p_none": 1 - decided,
+                "win_rate": p_tp / decided if decided > 0 else np.nan,
+                "breakeven_wr": 1 / (1 + rr_real),
+                "expectancy": float(pnl.mean()),
+                "days_to_tp": float(np.median(i_tp[tp_first]) + 1) if tp_first.any() else np.nan,
+                "days_to_sl": float(np.median(i_sl[sl_first]) + 1) if sl_first.any() else np.nan,
+            })
+    cand = pd.DataFrame(rows)
+    if cand.empty:
+        return {"tp": np.nan, "sl": np.nan, "rr": np.nan, "p_tp": np.nan, "p_sl": np.nan, "p_none": np.nan,
+                "win_rate": np.nan, "breakeven_wr": np.nan, "expectancy": np.nan, "days_to_tp": np.nan,
+                "days_to_sl": np.nan, "edge": np.nan, "resolve": np.nan, "candidates": cand,
+                "rr_band": (rr_lo, rr_hi)}
+    cand["edge"] = cand["win_rate"] - cand["breakeven_wr"]
+    cand["resolve"] = cand["p_tp"] + cand["p_sl"]
+    key = {"p_tp": ["p_tp", "expectancy"], "expectancy": ["expectancy", "p_tp"]}.get(objective, ["edge", "p_tp"])
+    ok = cand["resolve"] >= min_resolve
+    if objective == "edge" and not (cand["edge"] > 0).any():
+        # tidak ada R:R yang menguntungkan: tampilkan yang paling realistis (peluang TP tertinggi)
+        cand = cand.sort_values(["p_tp", "edge"], ascending=False)
+    elif objective == "edge" and ok.any():
+        cand = pd.concat([cand[ok].sort_values(key, ascending=False),
+                          cand[~ok].sort_values(key, ascending=False)])
+    else:
+        cand = cand.sort_values(key, ascending=False)
+    cand = cand.reset_index(drop=True)
+    best = cand.iloc[0].to_dict()
+    best["candidates"] = cand
+    best["rr_band"] = (rr_lo, rr_hi)
+    return best

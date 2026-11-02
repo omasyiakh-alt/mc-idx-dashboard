@@ -235,8 +235,28 @@ with st.sidebar:
                           help="Pengaruh sinyal memudar setengahnya tiap N hari bursa.")
 
     st.header("Target TP / SL")
-    p_tp = st.slider("Peluang TP tersentuh", 0.10, 0.90, 0.40, 0.05)
-    p_sl = st.slider("Peluang SL tersentuh", 0.05, 0.50, 0.20, 0.05)
+    tpsl_mode = st.radio("Metode", ["Target R:R per timeframe", "Peluang tersentuh"], index=0,
+                         help="R:R per timeframe: TP/SL dicari di dalam rentang R:R yang lazim untuk tiap "
+                              "timeframe, lalu dipilih yang paling didukung simulasi Monte Carlo.")
+    p_tp, p_sl = 0.40, 0.20
+    rr_bands = dict(mc.DEFAULT_RR)
+    if tpsl_mode.startswith("Target"):
+        objective = st.selectbox(
+            "Pilih TP/SL berdasarkan",
+            ["edge", "expectancy", "p_tp"],
+            format_func={"edge": "Edge peluang (disarankan)", "expectancy": "Expectancy tertinggi",
+                         "p_tp": "Peluang TP tertinggi"}.get,
+            help="Edge = win rate simulasi (TP lebih dulu ÷ TP atau SL tersentuh) dikurangi win rate impas "
+                 "1/(1+R). Edge positif berarti R:R itu menguntungkan menurut simulasi.",
+        )
+        with st.expander("Rentang R:R per timeframe"):
+            st.caption("Default: scalping 1D 1:1–1:1,5 · 1W 1:1,5–1:2 · swing 1M/3M 1:2–1:3 · 6M 1:2,5–1:3,5")
+            for h, (lo, hi) in mc.DEFAULT_RR.items():
+                rr_bands[h] = st.slider(f"R:R {h}", 0.5, 5.0, (float(lo), float(hi)), 0.25, key=f"rr_{h}")
+    else:
+        objective = "edge"
+        p_tp = st.slider("Peluang TP tersentuh", 0.10, 0.90, 0.40, 0.05)
+        p_sl = st.slider("Peluang SL tersentuh", 0.05, 0.50, 0.20, 0.05)
 
 # ----------------------------------------------------------------------------
 # Ambil data
@@ -387,7 +407,16 @@ all_tpsl = {}
 
 for (hname, days), tab in zip(mc.HORIZONS.items(), tabs):
     stats = mc.horizon_stats(res, days)
-    sug = mc.suggest_tp_sl(res, days, p_tp, p_sl)
+    if tpsl_mode.startswith("Target"):
+        lo, hi = rr_bands[hname]
+        sug = mc.suggest_tp_sl_rr(res, days, lo, hi, objective=objective)
+    else:
+        sug = mc.suggest_tp_sl(res, days, p_tp, p_sl)
+        dec = sug["p_tp"] + sug["p_sl"]
+        sug["win_rate"] = sug["p_tp"] / dec if dec > 0 else np.nan
+        sug["breakeven_wr"] = 1 / (1 + sug["rr"]) if np.isfinite(sug["rr"]) else np.nan
+        sug["edge"] = sug["win_rate"] - sug["breakeven_wr"]
+        sug["rr_band"] = None
     all_stats[hname] = stats
     all_tpsl[hname] = sug
     with tab:
@@ -400,6 +429,35 @@ for (hname, days), tab in zip(mc.HORIZONS.items(), tabs):
         k5.metric("P(SL lebih dulu)", fmt_pct(sug["p_sl"]))
         k6.metric("Expectancy", fmt_pct(sug["expectancy"], True),
                   help="Return rata-rata bila keluar di TP/SL, atau di akhir periode bila tidak tersentuh.")
+
+        if np.isfinite(sug.get("edge", np.nan)):
+            band = sug.get("rr_band")
+            band_txt = f"Target R:R {hname}: 1:{band[0]:g}–1:{band[1]:g}. " if band else ""
+            msg = (f"{band_txt}Dari jalur yang menyentuh TP atau SL, **{sug['win_rate']:.1%} menyentuh TP lebih dulu**. "
+                   f"Dengan R:R 1:{sug['rr']:.2f}, win rate impasnya {sug['breakeven_wr']:.1%}, "
+                   f"jadi edge-nya **{sug['edge'] * 100:+.1f} poin**.")
+            if sug["edge"] > 0.02:
+                st.success(msg + " Setup ini didukung simulasi.")
+            elif sug["edge"] >= -0.02:
+                st.info(msg + " Peluangnya hampir impas; keputusan bergantung pada keyakinan Anda pada sinyal.")
+            else:
+                st.warning(msg + " Pada rentang R:R ini simulasi belum memberi edge; pertimbangkan menunggu "
+                                 "atau memakai timeframe lain.")
+        elif tpsl_mode.startswith("Target"):
+            st.warning("Tidak ada kombinasi TP/SL yang masuk rentang R:R ini (fraksi harga terlalu kasar).")
+
+        cand = sug.get("candidates")
+        if cand is not None and len(cand) > 1:
+            with st.expander("Alternatif TP/SL di rentang R:R ini"):
+                show = cand.head(10)[["tp", "sl", "rr", "p_tp", "p_sl", "win_rate", "breakeven_wr", "edge",
+                                      "expectancy", "days_to_tp"]].copy()
+                show.columns = ["TP", "SL", "R:R", "P(TP dulu)", "P(SL dulu)", "Win rate", "Win rate impas",
+                                "Edge", "Expectancy", "Median hari ke TP"]
+                st.dataframe(show.style.format({
+                    "TP": "{:,.0f}", "SL": "{:,.0f}", "R:R": "1:{:.2f}", "P(TP dulu)": "{:.1%}",
+                    "P(SL dulu)": "{:.1%}", "Win rate": "{:.1%}", "Win rate impas": "{:.1%}", "Edge": "{:+.1%}",
+                    "Expectancy": "{:+.2%}", "Median hari ke TP": "{:.0f}"}, na_rep="-"),
+                    width="stretch", hide_index=True)
 
         left, right = st.columns([3, 2])
 
@@ -514,11 +572,13 @@ with tabs[len(mc.HORIZONS)]:
             "Return harapan": stt["Return harapan"], "P(naik)": stt["Prob. naik"],
             "VaR95": stt["VaR 95%"], "CVaR95": stt["CVaR 95%"],
             "TP": sug["tp"], "SL": sug["sl"], "R:R": sug["rr"],
-            "P(TP dulu)": sug["p_tp"], "P(SL dulu)": sug["p_sl"], "Expectancy": sug["expectancy"],
+            "P(TP dulu)": sug["p_tp"], "P(SL dulu)": sug["p_sl"], "Win rate": sug.get("win_rate", np.nan),
+            "Edge": sug.get("edge", np.nan), "Expectancy": sug["expectancy"],
         })
     summary = pd.DataFrame(rows).set_index("Horizon")
-    pct_cols = ["Return harapan", "P(naik)", "VaR95", "CVaR95", "P(TP dulu)", "P(SL dulu)", "Expectancy"]
-    st.dataframe(summary.style.format({**{c: "{:.2%}" for c in pct_cols}, "R:R": "{:.2f}",
+    pct_cols = ["Return harapan", "P(naik)", "VaR95", "CVaR95", "P(TP dulu)", "P(SL dulu)", "Win rate", "Edge",
+                "Expectancy"]
+    st.dataframe(summary.style.format({**{c: "{:.2%}" for c in pct_cols}, "R:R": "1:{:.2f}",
                                        "Median": "{:,.0f}", "P5": "{:,.0f}", "P95": "{:,.0f}",
                                        "TP": "{:,.0f}", "SL": "{:,.0f}"}),
                  width="stretch")

@@ -57,7 +57,21 @@ Log-return harian `r = μ_t + σ·z`:
 - `z` = bootstrap return historis (default, menangkap fat-tail riil), Student-t, atau Normal.
 - Skor FF dan Bandar (−1 … +1) digabung berbobot dan menggeser drift sebesar `skor × kekuatan × σ`, memudar dengan waktu paruh (default 21 hari). Skor negatif (distribusi) juga menaikkan volatilitas.
 - Tiap langkah dipotong batas ARA (35% / 25% / 20% sesuai fraksi harga) dan ARB (default 15%, bisa diubah).
-- **TP** = harga yang disentuh oleh X% jalur (default 40%); **SL** = harga yang disentuh oleh Y% jalur (default 20%).
+- **TP/SL (default: Target R:R per timeframe)**. Rentang R:R mengikuti kaidah umum dan bisa diubah di sidebar:
+
+  | Timeframe | Gaya | R:R |
+  |---|---|---|
+  | 1D | scalping | 1:1 – 1:1,5 |
+  | 1W | transisi | 1:1,5 – 1:2 |
+  | 1M, 3M | swing | 1:2 – 1:3 |
+  | 6M | posisi | 1:2,5 – 1:3,5 |
+
+  Kandidat SL diambil dari harga terendah intra-periode yang disentuh 5%–50% jalur. Untuk tiap SL, TP = harga masuk + R × risiko,
+  dengan R di dalam rentang. Setiap pasangan diuji pada semua jalur (mana yang tersentuh lebih dulu). Lalu dipilih yang
+  **edge**-nya terbesar: win rate simulasi (TP lebih dulu ÷ TP atau SL tersentuh) dikurangi win rate impas 1/(1+R).
+  Bila tidak ada pasangan dengan edge positif, dashboard memilih peluang TP tertinggi dan memberi peringatan.
+  Pilihan lain: expectancy tertinggi atau peluang TP tertinggi. Tabel alternatif menampilkan 10 pasangan teratas.
+- Metode lama (**Peluang tersentuh**) tetap tersedia: TP = harga yang disentuh X% jalur, SL = harga yang disentuh Y% jalur.
 
 ### Skor Foreign Flow
 50% intensitas (net asing ÷ nilai transaksi), 25% konsistensi (hari net buy vs net sell), 25% tren kumulatif.
